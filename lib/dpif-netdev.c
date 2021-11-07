@@ -8510,9 +8510,43 @@ dp_netdev_recirculate(struct dp_netdev_pmd_thread *pmd,
     dp_netdev_input__(pmd, packets, true, 0);
 }
 
+#define MAX_REDO_ACTIONS 4
+struct redo_actions_stack {
+    int top;
+    const struct nlattr *redo_actions[MAX_REDO_ACTIONS];
+};
+
+#define REDO_ACTIONS_STACK_INITIALIZER { .top = -1 }
+static const struct nlattr *
+redo_actions_stack_top(struct redo_actions_stack *s)
+{
+    return s->top == -1 ? NULL : s->redo_actions[s->top];
+}
+
+static void
+redo_actions_stack_push(struct redo_actions_stack *s,
+                        const struct nlattr *act)
+{
+    const struct nlattr *top_act = redo_actions_stack_top(s);
+    if (act != top_act && s->top + 1 < MAX_REDO_ACTIONS) {
+        s->redo_actions[++s->top] = act;
+    }
+}
+
+static const struct nlattr *
+redo_actions_stack_pop(struct redo_actions_stack *s,
+                       const struct nlattr *a)
+{
+    const struct nlattr *top_act = redo_actions_stack_top(s);
+    if (top_act == a)
+        s->top --;
+    return top_act;
+}
+
 struct dp_netdev_execute_aux {
     struct dp_netdev_pmd_thread *pmd;
     const struct flow *flow;
+    struct redo_actions_stack stack;
 };
 
 static void
@@ -9042,10 +9076,23 @@ dp_execute_cb(void *aux_, struct dp_packet_batch *packets_,
             VLOG_WARN_RL(&rl, "NAT specified without commit.");
         }
 
-        conntrack_execute(dp->conntrack, packets_, aux->flow->dl_type, force,
-                          commit, zone, setmark, setlabel, aux->flow->tp_src,
-                          aux->flow->tp_dst, helper, nat_action_info_ref,
-                          pmd->ctx.now / 1000, tp_id);
+        bool more_pkts;
+        struct ipf_ctx ipf_ctx = { aux->flow->recirc_id,
+                                   aux->flow->in_port.odp_port,
+                                   zone };
+        more_pkts = conntrack_execute(dp->conntrack, packets_,
+                                      aux->flow->dl_type,
+                                      force, commit, zone,
+                                      setmark, setlabel,
+                                      aux->flow->tp_src,
+                                      aux->flow->tp_dst,
+                                      helper, nat_action_info_ref,
+                                      pmd->ctx.now / 1000, tp_id, &ipf_ctx);
+        if (more_pkts) {
+            redo_actions_stack_push(&aux->stack, a);
+        } else {
+            redo_actions_stack_pop(&aux->stack, a);
+        }
         break;
     }
 
@@ -9080,16 +9127,90 @@ dp_execute_cb(void *aux_, struct dp_packet_batch *packets_,
     dp_packet_delete_batch(packets_, should_steal);
 }
 
+static size_t
+dp_netdev_find_actions_left(const struct nlattr *actions,
+                            size_t actions_len,
+                            const struct nlattr *target)
+{
+    const struct nlattr *a;
+    size_t left;
+    NL_ATTR_FOR_EACH_UNSAFE (a, left, actions, actions_len) {
+        if (a == target) {
+            break;
+        }
+    }
+    return left;
+}
+/* ipf module might emit packets that one single batch cannot
+ * contain. So we have to redo the ct actions to let ipf emit
+ * all the packets, otherwise we will wait the packet batch
+ * with the right ipf_ctx, and at that time the ipf could
+ * emit the rest packets.
+ *
+ * One action list might contain more than one ct actions. thus
+ * we use a action stack to track the action that needs to redo in
+ * one execution.
+ *
+ * An complicated example:
+ *
+ * Action List:           ct1    ..   ct2    ...
+ * first run:
+ *           more_pkts?:  yes    ..   yes
+ *           stack:     push ct1 .. push ct2
+ *           stack_top:   ct1    ..   ct2
+ *
+ * second run: (begins with ct2)
+ *           more_pkts?:              no
+ *           stack:                 pop ct2
+ *           stack_top:               ct1
+ *
+ * third run: (begins with ct1)
+ *           more_pkts?:  yes    ..   no
+ *           stack_top:   ct1         ct1 (first try push ct1,
+ *                                         then try pop ct2,
+ *                                         both not working)
+ *
+ * forth run: (begins with ct1)
+ *           more_pkts?:  no     ..   yes    ...
+ *           stack_top:   empty  ..   ct2    ...
+ *
+ * fifth run: (begins with ct2)
+ *           more_pkts?:              no     ...
+ *           stack_top:               empty  ...
+ * done
+ *
+ * if the action list contains more ct actions, the stack
+ * might not contain that much of actions, at this time,
+ * we have to wait, but more than 1 ct actions should be
+ * rare in the practice.
+ */
+
 static void
 dp_netdev_execute_actions(struct dp_netdev_pmd_thread *pmd,
                           struct dp_packet_batch *packets,
                           bool should_steal, const struct flow *flow,
                           const struct nlattr *actions, size_t actions_len)
 {
-    struct dp_netdev_execute_aux aux = { pmd, flow };
+    struct dp_netdev_execute_aux aux = { pmd, flow, REDO_ACTIONS_STACK_INITIALIZER };
 
     odp_execute_actions(&aux, packets, should_steal, actions,
                         actions_len, dp_execute_cb);
+
+    const struct nlattr *top = redo_actions_stack_top(&aux.stack);
+    while (OVS_UNLIKELY(top)) {
+        struct dp_packet_batch batch;
+        dp_packet_batch_init(&batch);
+        size_t redo_actions_len = dp_netdev_find_actions_left(actions,
+                                                              actions_len,
+                                                              top);
+        /* NOTE: currently only CT action needs to be redo, the ipf
+         * clones the packets, so should_steal needs to be set to
+         * true to free the batches
+         */
+        odp_execute_actions(&aux, &batch, true,
+                            top, redo_actions_len, dp_execute_cb);
+        top = redo_actions_stack_top(&aux.stack);
+    }
 }
 
 struct dp_netdev_ct_dump {
