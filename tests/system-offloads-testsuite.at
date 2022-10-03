@@ -114,8 +114,8 @@ conntrack - DNAT load balancing with NC
 
 # Occasionalt we fail with extreme high byte counters, i.e.
 # n_bytes=18446744073705804134
-datapath - truncate and output to gre tunnel by simulated packets
-datapath - truncate and output to gre tunnel
+#datapath - truncate and output to gre tunnel by simulated packets
+#datapath - truncate and output to gre tunnel
 "
 echo "$ovs_test_skip_list" | sed "s/<SPC>/ /g"])
 

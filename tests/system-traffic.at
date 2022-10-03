@@ -1635,7 +1635,7 @@ on_exit 'rm -f payload200.bin'
 
 AT_CHECK([ovs-ofctl del-flows br0])
 AT_DATA([flows.txt], [dnl
-priority=99,in_port=1,actions=output(port=2,max_len=100),output(port=3,max_len=100)
+priority=99,in_port=1,ip,actions=output(port=2,max_len=100),output(port=3,max_len=100)
 priority=99,in_port=2,udp,actions=output(port=1,max_len=100)
 priority=1,in_port=4,ip,actions=drop
 priority=1,actions=drop
@@ -1708,7 +1708,11 @@ OVS_REVALIDATOR_PURGE()
 OVS_WAIT_UNTIL([ovs-ofctl dump-flows br0 | grep "in_port=4" | ofctl_strip | grep "n_packets=1, n_bytes=100, priority=1,ip,in_port=4 actions=drop"],
                [ovs-ofctl dump-flows br0 | grep "in_port=4" | ofctl_strip])
 
-OVS_TRAFFIC_VSWITCHD_STOP
+OVS_TRAFFIC_VSWITCHD_STOP(["dnl
+/.*lost packet on port.*/d
+/.failed to flow_get.*/d
+/.failed to flow_del.*/d
+/.*Failed to acquire udpif_key corresponding to unexpected flow.*/d"])
 AT_CLEANUP
 
 dnl Create 2 bridges and 2 namespaces to test truncate over
@@ -1762,7 +1766,7 @@ on_exit 'rm -f payload200.bin'
 
 AT_CHECK([ovs-ofctl del-flows br0])
 AT_DATA([flows.txt], [dnl
-priority=99,in_port=1,actions=output(port=2,max_len=100),output(port=3,max_len=100)
+priority=99,in_port=1,ip,actions=output(port=2,max_len=100),output(port=3,max_len=100)
 priority=99,in_port=2,udp,actions=output(port=1,max_len=100)
 priority=1,in_port=4,ip,actions=drop
 priority=1,actions=drop
@@ -1771,6 +1775,8 @@ AT_CHECK([ovs-ofctl add-flows br0 flows.txt])
 
 AT_CHECK([ovs-ofctl del-flows br-underlay])
 AT_DATA([flows-underlay.txt], [dnl
+priority=99,arp,in_port=1,actions=LOCAL
+priority=99,arp,in_port=LOCAL,actions=1
 priority=99,dl_type=0x0800,nw_proto=47,in_port=1,actions=LOCAL
 priority=99,dl_type=0x0800,nw_proto=47,in_port=LOCAL,ip_dst=172.31.1.1/24,actions=1
 priority=1,actions=drop
@@ -1787,7 +1793,7 @@ AT_CHECK([ovs-ofctl dump-flows br0 | grep "in_port=2" | sed -n 's/.*\(n\_bytes=[
 n_bytes=242
 ])
 dnl After truncation = outer ETH(14) + outer IP(20) + GRE(4) + 100 = 138B
-AT_CHECK([ovs-ofctl dump-flows br-underlay | grep "in_port=LOCAL" | sed -n 's/.*\(n\_bytes=[[0-9]]*\).*/\1/p'], [0], [dnl
+AT_CHECK([ovs-ofctl dump-flows br-underlay | grep "ip,in_port=LOCAL" | sed -n 's/.*\(n\_bytes=[[0-9]]*\).*/\1/p'], [0], [dnl
 n_bytes=138
 ])
 
@@ -1822,7 +1828,7 @@ AT_CHECK([ovs-ofctl dump-flows br0 | grep "in_port=2" | sed -n 's/.*\(n\_bytes=[
 n_bytes=242
 ])
 dnl After truncation = outer ETH(14) + outer IP(20) + GRE(4) + 100 = 138B
-AT_CHECK([ovs-ofctl dump-flows br-underlay | grep "in_port=LOCAL" | sed -n 's/.*\(n\_bytes=[[0-9]]*\).*/\1/p'], [0], [dnl
+AT_CHECK([ovs-ofctl dump-flows br-underlay | grep "ip,in_port=LOCAL" | sed -n 's/.*\(n\_bytes=[[0-9]]*\).*/\1/p'], [0], [dnl
 n_bytes=138
 ])
 
@@ -1834,7 +1840,11 @@ AT_CHECK([ovs-ofctl dump-flows br0 | grep "in_port=4" | ofctl_strip], [0], [dnl
  n_packets=1, n_bytes=100, priority=1,ip,in_port=4 actions=drop
 ])
 
-OVS_TRAFFIC_VSWITCHD_STOP
+OVS_TRAFFIC_VSWITCHD_STOP(["dnl
+/.*lost packet on port.*/d
+/.failed to flow_get.*/d
+/.failed to flow_del.*/d
+/.*Failed to acquire udpif_key corresponding to unexpected flow.*/d"])
 AT_CLEANUP
 
 AT_SETUP([datapath - configure cache size])
